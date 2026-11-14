@@ -44,6 +44,20 @@ async function findRepo($: EngineInterface): Promise<string | undefined> {
   return undefined
 }
 
+async function ghApi(
+  $: EngineInterface, cwd: string, path: string,
+): Promise<{ ok: true; data: unknown } | { ok: false; error: string }> {
+  const r = await $.process.run(['gh', 'api', path], { cwd, timeoutMs: 20_000 })
+  if (r.exitCode !== 0) {
+    return { ok: false, error: (r.stderr.trim().split('\n')[0] ?? 'gh falhou').slice(0, 120) }
+  }
+  try {
+    return { ok: true, data: JSON.parse(r.stdout) }
+  } catch {
+    return { ok: false, error: 'resposta inválida do gh' }
+  }
+}
+
 async function refresh($: EngineInterface): Promise<void> {
   if (isRefreshing) return
   isRefreshing = true
@@ -57,32 +71,46 @@ async function refresh($: EngineInterface): Promise<void> {
     const br = await $.process.run(['git', 'rev-parse', '--abbrev-ref', 'HEAD'], { cwd: repoDir })
     const branch = br.stdout.trim()
     const checkedAt = await $.clock.now()
-    const view = await $.process.run(
-      ['gh', 'pr', 'view', '--json', 'number,title,url,state,isDraft,statusCheckRollup'],
-      { cwd: repoDir, timeoutMs: 20_000 },
-    )
+    // GitHub's GraphQL API is not reachable from Claude Code cloud sessions, so this uses REST only.
+    const remote = await $.process.run(['git', 'remote', 'get-url', 'origin'], { cwd: repoDir })
+    const slug = /[/:]([^/:]+)\/([^/]+?)(?:\.git)?\/?$/.exec(remote.stdout.trim())
+    const empty = { repoDir, branch, pr: null, passed: 0, failed: 0, pending: 0, failedNames: [], checkedAt }
     let next: CiSnapshot
-    if (view.exitCode !== 0) {
-      const noPr = /no pull requests found/i.test(view.stderr)
-      next = {
-        repoDir, branch, pr: null, passed: 0, failed: 0, pending: 0, failedNames: [], checkedAt,
-        error: noPr ? undefined : view.stderr.trim().split('\n')[0]?.slice(0, 120),
-      }
+    if (remote.exitCode !== 0 || slug === null) {
+      next = { ...empty, error: 'sem remote do GitHub' }
     } else {
-      const data = JSON.parse(view.stdout) as {
-        number: number; title: string; url: string; state: string; isDraft: boolean
-        statusCheckRollup?: Check[]
-      }
-      const checks = data.statusCheckRollup ?? []
-      const kinds = checks.map(classify)
-      next = {
-        repoDir, branch,
-        pr: { number: data.number, title: data.title, url: data.url, state: data.state, isDraft: data.isDraft },
-        passed: kinds.filter(k => k === 'pass').length,
-        failed: kinds.filter(k => k === 'fail').length,
-        pending: kinds.filter(k => k === 'pending').length,
-        failedNames: checks.filter((_, i) => kinds[i] === 'fail').map(c => c.name ?? c.context ?? '?'),
-        checkedAt,
+      const repo = `repos/${slug[1]}/${slug[2]}`
+      const pulls = await ghApi($, repoDir, `${repo}/pulls?head=${slug[1]}:${encodeURIComponent(branch)}&state=all&per_page=1`)
+      if (!pulls.ok) {
+        next = { ...empty, error: pulls.error }
+      } else if (!Array.isArray(pulls.data) || pulls.data.length === 0) {
+        next = empty
+      } else {
+        const pr = pulls.data[0] as {
+          number: number; title: string; html_url: string; state: string
+          merged_at: string | null; draft?: boolean; head: { sha: string }
+        }
+        const runs = await ghApi($, repoDir, `${repo}/commits/${pr.head.sha}/check-runs?per_page=100`)
+        const status = await ghApi($, repoDir, `${repo}/commits/${pr.head.sha}/status`)
+        const checks: Check[] = [
+          ...((runs.ok ? (runs.data as { check_runs?: Check[] }).check_runs : undefined) ?? []),
+          ...((status.ok ? (status.data as { statuses?: Check[] }).statuses : undefined) ?? [])
+            .map(c => ({ ...c, __typename: 'StatusContext' })),
+        ]
+        const kinds = checks.map(classify)
+        next = {
+          repoDir, branch,
+          pr: {
+            number: pr.number, title: pr.title, url: pr.html_url,
+            state: pr.merged_at ? 'MERGED' : pr.state.toUpperCase(), isDraft: pr.draft === true,
+          },
+          passed: kinds.filter(k => k === 'pass').length,
+          failed: kinds.filter(k => k === 'fail').length,
+          pending: kinds.filter(k => k === 'pending').length,
+          failedNames: checks.filter((_, i) => kinds[i] === 'fail').map(c => c.name ?? c.context ?? '?'),
+          checkedAt,
+          error: runs.ok ? undefined : runs.error,
+        }
       }
     }
     const prev = await read($, snapshot)

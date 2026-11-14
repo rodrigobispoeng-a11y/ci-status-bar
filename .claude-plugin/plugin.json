@@ -1,0 +1,1 @@
+{ "name": "ci-status-bar", "version": "0.1.0", "description": "Barra acima do prompt com o PR do branch atual e o progresso dos checks de CI do GitHub", "types": "./types/index.d.ts", "license": "MIT", "author": { "name": "Rodrigo" } }

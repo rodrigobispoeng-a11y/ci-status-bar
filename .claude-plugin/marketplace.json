@@ -1,0 +1,11 @@
+{
+  "name": "ci-status-bar",
+  "owner": { "name": "Rodrigo" },
+  "plugins": [
+    {
+      "name": "ci-status-bar",
+      "source": "./",
+      "description": "Barra acima do prompt com o PR do branch atual e o progresso dos checks de CI do GitHub"
+    }
+  ]
+}
